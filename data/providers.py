@@ -13,17 +13,31 @@ CACHE_DIR = Path(__file__).resolve().parent / "cache" / "prices"
 USER_AGENT = "quant-portfolio/1.0 (research backtest)"
 
 
-def cached_tiingo_tickers(start: str, end: str | None = None) -> list[str]:
-    """Tickers already on disk for this start/end window."""
+def cached_tiingo_tickers(start: str, end: str | None = None, field: str = "adjClose") -> list[str]:
+    """Tickers already on disk (or marked as no-data) for this start/end window."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     end_key = end or "latest"
+    prefix = "tiingo" if field == "adjClose" else f"tiingo{field.lower()}"
     out: list[str] = []
-    for path in CACHE_DIR.glob(f"tiingo_*_{start}_{end_key}.csv"):
+    for path in [*CACHE_DIR.glob(f"{prefix}_*_{start}_{end_key}.csv"),
+                 *CACHE_DIR.glob(f"{prefix}_*_{start}_{end_key}.empty")]:
         # tiingo_AAPL_2018-01-01_latest.csv
         parts = path.name.split("_")
         if len(parts) >= 4:
             out.append(parts[1].upper())
     return sorted(set(out))
+
+
+def load_cached_frame(tickers: list[str], start: str, end: str | None = None, field: str = "adjClose") -> pd.DataFrame:
+    """Cache-only read (never hits the API); names not on disk are left out."""
+    end_key = end or "latest"
+    prefix = "tiingo" if field == "adjClose" else f"tiingo{field.lower()}"
+    cols = {}
+    for t in tickers:
+        path = CACHE_DIR / f"{prefix}_{normalize_ticker(t)}_{start}_{end_key}.csv"
+        if path.exists():
+            cols[normalize_ticker(t)] = pd.read_csv(path, index_col=0, parse_dates=True).iloc[:, 0]
+    return pd.DataFrame(cols).sort_index()
 
 
 def normalize_ticker(ticker: str) -> str:
@@ -57,8 +71,10 @@ def fetch_tiingo_adj_close(
     end: str | None = None,
     *,
     max_retries: int = 8,
+    field: str = "adjClose",
 ) -> pd.Series:
-    """Tiingo adjusted close — requires TIINGO_API_KEY (free starter OK)."""
+    """Tiingo adjusted close (or another daily field such as the as-traded "close")
+    — requires TIINGO_API_KEY (free starter OK)."""
     key = _tiingo_token()
     if not key:
         raise RuntimeError(
@@ -89,7 +105,7 @@ def fetch_tiingo_adj_close(
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
         df = df.set_index("date").sort_index()
-        col = "adjClose" if "adjClose" in df.columns else "close"
+        col = field if field in df.columns else "close"
         s = df[col].astype(float)
         s.name = t
         return s
@@ -105,8 +121,10 @@ def load_price_frame(
     provider: str = "tiingo",
     use_cache: bool = True,
     pause_sec: float = 1.0,  # only applies on live fetches; cached reads are free
+    field: str = "adjClose",
 ) -> pd.DataFrame:
-    """Download (or cache-load) adjusted closes; columns = normalized tickers."""
+    """Download (or cache-load) adjusted closes; columns = normalized tickers.
+    field="close" loads as-traded (split/dividend-unadjusted) closes instead."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     provider = provider.lower().strip()
     if provider != "tiingo":
@@ -121,17 +139,24 @@ def load_price_frame(
 
     for i, t in enumerate(ordered, 1):
         end_key = end or "latest"
-        cache_path = CACHE_DIR / f"tiingo_{t}_{start}_{end_key}.csv"
-        if use_cache and cache_path.exists():
+        prefix = "tiingo" if field == "adjClose" else f"tiingo{field.lower()}"
+        cache_path = CACHE_DIR / f"{prefix}_{t}_{start}_{end_key}.csv"
+        # Tiingo had no data for this symbol (e.g. renamed ticker): don't spend a request again
+        empty_marker = cache_path.with_suffix(".empty")
+        if use_cache and empty_marker.exists():
+            s = pd.Series(dtype=float, name=t)
+        elif use_cache and cache_path.exists():
             s = pd.read_csv(cache_path, index_col=0, parse_dates=True).squeeze("columns")
             if isinstance(s, pd.DataFrame):
                 s = s.iloc[:, 0]
             s.name = t
         else:
             try:
-                s = fetch_tiingo_adj_close(t, start, end)
+                s = fetch_tiingo_adj_close(t, start, end, field=field)
                 if use_cache and not s.empty:
                     s.to_csv(cache_path, header=True)
+                elif use_cache:
+                    empty_marker.touch()
             except Exception as exc:  # noqa: BLE001
                 msg = str(exc)
                 # never echo URLs that embed the API token

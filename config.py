@@ -67,6 +67,13 @@ STATARB_EXIT_Z = 0.5
 STATARB_STOP_Z = 4.0
 STATARB_HL_TIMEOUT_MULT = 2.0  # exit if not mean-reverted within 2 * half-life days
 STATARB_WEIGHT = 0.5
+# "pair_book": log spread, beta/mean/std frozen at entry, fixed 1/COINT_MAX_PAIRS per pair,
+# open trades carried across refreshes (strategies/pair_book.py). "legacy": daily re-hedge + L1 book.
+STATARB_BOOK = "pair_book"
+STATARB_SPREAD = "log"
+STATARB_EXCLUDED_SECTORS: list[str] = []  # train-window sector picks were unstable out of sample
+# Entry filter: skip if the recent (2 x lookback) AR(1) half-life > ratio x screening half-life
+STATARB_HL_MAX_RATIO: float | None = 2.0
 
 # z-score / lookback grid (run_z_sweep.py); stop must be > entry > exit
 Z_SWEEP_LOOKBACKS = [42, 60, 90]
@@ -126,6 +133,8 @@ COINT_STABILITY_STEP = 63
 COINT_MIN_STABILITY = 0.0
 COINT_MAX_PAIRS = 24
 COINT_MAX_PER_SECTOR = 3
+# Pair-candidate GICS level: "sector" | "sub_industry" (per-group cap applies at that level)
+PAIR_GROUP_LEVEL = "sector"
 COINT_MAX_NAMES_PER_SECTOR = 15
 
 # Pair-candidate grouping before cointegration (None = GICS sectors as-is)

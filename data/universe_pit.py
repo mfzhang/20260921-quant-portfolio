@@ -12,7 +12,7 @@ try:
 except ImportError as exc:  # pragma: no cover
     raise ImportError("pip install pitindex") from exc
 
-from data.pit_sector_overrides import SECTOR_OVERRIDES
+from data.pit_sector_overrides import SECTOR_OVERRIDES, SUB_INDUSTRY_OVERRIDES
 
 
 def normalize_ticker(t: str) -> str:
@@ -34,6 +34,8 @@ def constituents_asof(as_of: str | pd.Timestamp, index: str = "sp500") -> pd.Dat
     df = pitindex.get_constituents(pd.Timestamp(as_of).date().isoformat(), index=index).copy()
     fill = df["ticker"].map(lambda t: SECTOR_OVERRIDES.get(normalize_ticker(t)))
     df["gics_sector"] = df["gics_sector"].fillna(fill)
+    sub_fill = df["ticker"].map(lambda t: SUB_INDUSTRY_OVERRIDES.get(normalize_ticker(t)))
+    df["gics_sub_industry"] = df["gics_sub_industry"].fillna(sub_fill)
     return df
 
 
@@ -124,16 +126,27 @@ def sector_groups_asof(
     *,
     index: str = "sp500",
     min_names: int = 2,
+    level: str = "sector",
 ) -> dict[str, list[str]]:
-    """GICS sector -> tickers present as of date (and optionally in `tickers`)."""
+    """
+    GICS group -> tickers present as of date (and optionally in `tickers`).
+    level="sector" groups by GICS sector; level="sub_industry" by GICS
+    sub-industry (the finest GICS level), keyed "Sector / Sub-industry".
+    """
     df = constituents_asof(as_of, index=index).copy()
     df["ticker"] = df["ticker"].map(normalize_ticker)
     if tickers is not None:
         allowed = {normalize_ticker(t) for t in tickers}
         df = df[df["ticker"].isin(allowed)]
     df["gics_sector"] = df["gics_sector"].fillna("Unknown")
+    if level == "sub_industry":
+        df["group"] = df["gics_sector"] + " / " + df["gics_sub_industry"].fillna("Unknown")
+    elif level == "sector":
+        df["group"] = df["gics_sector"]
+    else:
+        raise ValueError(f"unknown group level: {level}")
     groups: dict[str, list[str]] = {}
-    for sector, part in df.groupby("gics_sector"):
+    for sector, part in df.groupby("group"):
         names = sorted(part["ticker"].unique().tolist())
         if len(names) >= min_names:
             groups[str(sector)] = names

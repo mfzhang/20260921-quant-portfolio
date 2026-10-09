@@ -41,6 +41,7 @@ from strategies.regime import (
     rebalance_breakeven_pct,
     regime_gross_scaler,
 )
+from strategies.pair_book import build_pair_book
 from strategies.rolling_pairs import build_rolling_stat_arb_weights
 from strategies.stat_arb import build_stat_arb_weights
 from strategies.universe_structure import make_primary_grouping_fn
@@ -157,7 +158,8 @@ def main() -> None:
     def _groups_asof(asof, tickers):
         if config.USE_PIT_UNIVERSE:
             return sector_groups_asof(
-                asof, tickers=tickers, index=config.PIT_INDEX, min_names=2
+                asof, tickers=tickers, index=config.PIT_INDEX, min_names=2,
+                level=config.PAIR_GROUP_LEVEL,
             )
         return config.SECTOR_GROUPS
 
@@ -186,6 +188,26 @@ def main() -> None:
             verbose=True,
         )
         pair_log.to_csv(out_dir / "rolling_pairs_log.csv", index=False)
+        if config.STATARB_BOOK == "pair_book":
+            w_stat, pair_trades = build_pair_book(
+                prices,
+                pair_log,
+                lookback=config.STATARB_LOOKBACK,
+                entry_z=config.STATARB_ENTRY_Z,
+                exit_z=config.STATARB_EXIT_Z,
+                stop_z=config.STATARB_STOP_Z,
+                timeout_mult=config.STATARB_HL_TIMEOUT_MULT,
+                membership=membership,
+                formation_days=config.COINT_FORMATION_DAYS,
+                refresh_days=config.COINT_REFRESH_DAYS,
+                pair_budget=1.0 / config.COINT_MAX_PAIRS,
+                spread=config.STATARB_SPREAD,
+                excluded_sectors=tuple(config.STATARB_EXCLUDED_SECTORS),
+                fallback_pairs=fallback_pairs,
+                hl_max_ratio=config.STATARB_HL_MAX_RATIO,
+            )
+            pair_trades.to_csv(out_dir / "pair_trades.csv", index=False)
+            print(f"Pair book trades: {len(pair_trades)}")
         trade_start = prices.index[config.COINT_FORMATION_DAYS]
         # flat during initial formation
         w_stat.loc[prices.index < trade_start] = 0.0
@@ -263,7 +285,8 @@ def main() -> None:
             timeout_mult=config.STATARB_HL_TIMEOUT_MULT,
         )
 
-    if membership is not None:
+    # pair_book closes both legs itself when a leg leaves the index and must keep fixed sizing
+    if membership is not None and not (config.USE_ROLLING_PAIRS and config.STATARB_BOOK == "pair_book"):
         w_stat = _renorm_l1(w_stat.where(membership, 0.0))
 
     print("Building cross-sectional mean-reversion weights ...")
