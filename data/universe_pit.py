@@ -45,17 +45,21 @@ def pit_price_tickers(
     index: str = "sp500",
     max_names: int = 50,
     seed: list[str] | None = None,
+    include_unknown_sector: bool = False,
 ) -> list[str]:
     """
     Names to price: members as of `start` only (no look-ahead), `seed` first,
     then round-robin across GICS sectors (alphabetical within a sector) so the
-    universe widens evenly instead of by ticker spelling.
+    universe widens evenly instead of by ticker spelling. pitindex leaves most
+    S&P 400 sectors blank; include_unknown_sector adds them as one more queue.
     """
     roster = constituents_asof(start, index=index)
     roster["ticker"] = roster["ticker"].map(normalize_ticker)
     members = set(roster["ticker"])
     picked = [t for t in dict.fromkeys(normalize_ticker(s) for s in (seed or [])) if t in members]
 
+    if include_unknown_sector:
+        roster["gics_sector"] = roster["gics_sector"].fillna("Unknown")
     queues = {
         sector: sorted(set(part["ticker"]) - set(picked))
         for sector, part in roster.dropna(subset=["gics_sector"]).groupby("gics_sector")

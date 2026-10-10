@@ -40,6 +40,10 @@ def load_cached_frame(tickers: list[str], start: str, end: str | None = None, fi
     return pd.DataFrame(cols).sort_index()
 
 
+def _prefix(field: str) -> str:
+    return "tiingo" if field == "adjClose" else f"tiingo{field.lower()}"
+
+
 def normalize_ticker(ticker: str) -> str:
     """BRK.B -> BRK-B style used by Tiingo US equities."""
     return ticker.replace(".", "-").upper().strip()
@@ -75,6 +79,23 @@ def fetch_tiingo_adj_close(
 ) -> pd.Series:
     """Tiingo adjusted close (or another daily field such as the as-traded "close")
     — requires TIINGO_API_KEY (free starter OK)."""
+    df = fetch_tiingo_daily(ticker, start, end, max_retries=max_retries)
+    t = normalize_ticker(ticker)
+    if df.empty:
+        return pd.Series(dtype=float, name=t)
+    s = df[field if field in df.columns else "close"].astype(float)
+    s.name = t
+    return s
+
+
+def fetch_tiingo_daily(
+    ticker: str,
+    start: str,
+    end: str | None = None,
+    *,
+    max_retries: int = 8,
+) -> pd.DataFrame:
+    """All Tiingo daily fields (close, adjClose, ...) in one request."""
     key = _tiingo_token()
     if not key:
         raise RuntimeError(
@@ -92,7 +113,7 @@ def fetch_tiingo_adj_close(
     for attempt in range(max_retries):
         resp = requests.get(url, params=params, headers=headers, timeout=30)
         if resp.status_code == 404:
-            return pd.Series(dtype=float, name=t)
+            return pd.DataFrame()
         if resp.status_code == 429:
             wait = min(90 * (attempt + 1), 600)
             print(f"  rate-limited on {t}; sleeping {wait}s (attempt {attempt + 1}/{max_retries})")
@@ -101,14 +122,10 @@ def fetch_tiingo_adj_close(
         resp.raise_for_status()
         data = resp.json()
         if not data:
-            return pd.Series(dtype=float, name=t)
+            return pd.DataFrame()
         df = pd.DataFrame(data)
         df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
-        df = df.set_index("date").sort_index()
-        col = field if field in df.columns else "close"
-        s = df[col].astype(float)
-        s.name = t
-        return s
+        return df.set_index("date").sort_index()
 
     raise RuntimeError(f"Tiingo rate limit persisted for {t}")
 
@@ -152,9 +169,15 @@ def load_price_frame(
             s.name = t
         else:
             try:
-                s = fetch_tiingo_adj_close(t, start, end, field=field)
+                df = fetch_tiingo_daily(t, start, end)
+                s = df[field].astype(float).rename(t) if field in df.columns else pd.Series(dtype=float, name=t)
                 if use_cache and not s.empty:
                     s.to_csv(cache_path, header=True)
+                    # the same response carries the other close; cache it to save a request later
+                    for other in {"adjClose", "close"} - {field}:
+                        other_path = CACHE_DIR / f"{_prefix(other)}_{t}_{start}_{end_key}.csv"
+                        if other in df.columns and not other_path.exists():
+                            df[other].astype(float).rename(t).to_csv(other_path, header=True)
                 elif use_cache:
                     empty_marker.touch()
             except Exception as exc:  # noqa: BLE001

@@ -44,8 +44,14 @@ TAGS = (
     "GrossProfit",
     "CostOfRevenue",
     "CostOfGoodsAndServicesSold",
+    "OperatingIncomeLoss",
+    "CashAndCashEquivalentsAtCarryingValue",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    "LongTermDebtCurrent",
+    "DebtCurrent",
+    "ShortTermBorrowings",
 )
-_CACHE_VERSION = "v4"  # bump when TAGS change so cached extracts are refetched
+_CACHE_VERSION = "v5"  # bump when TAGS change so cached extracts are refetched
 _PAUSE_SEC = 0.15  # SEC fair-access limit is 10 requests/second
 
 
@@ -342,6 +348,131 @@ def _split_factor(adj: pd.Series, raw: pd.Series, d0: pd.Timestamp, d1: pd.Times
         inv = 1 / k
         return 1 / (round(inv * 2) / 2 if inv < 5 else float(round(inv)))
     return 1.0
+
+
+def book_per_share_asof(facts: pd.DataFrame, asof: pd.Timestamp) -> tuple[float, pd.Timestamp | None]:
+    """Latest total equity / weighted diluted (else basic) shares of the latest
+    reported period, in the share basis of the filing that carried the shares."""
+    eq, eq_end = _equity_asof(facts, asof)
+    if eq_end is None or (asof - eq_end).days > 200:
+        return np.nan, None
+    f = facts[facts["tag"].isin(_SHARES) & facts["start"].notna() & (facts["filed"] <= asof)]
+    for tag in _SHARES:
+        g = f[f["tag"] == tag]
+        if g.empty:
+            continue
+        last = g.sort_values(["end", "filed"]).iloc[-1]
+        if last["val"] > 0 and abs((last["end"] - eq_end).days) <= 100:
+            return float(eq / (last["val"] * _share_scale(facts, asof, last["val"]))), last["filed"]
+    return np.nan, None
+
+
+def _share_scale(facts: pd.DataFrame, asof: pd.Timestamp, shares: float) -> float:
+    """Some filers tag share counts in thousands or millions; recover the unit
+    from net income / shares vs reported EPS (powers of 1000 only)."""
+    ni, _ = _ttm_flow(facts, ("NetIncomeLoss", "ProfitLoss"), asof)
+    eps, _ = ttm_eps_asof(facts, asof)
+    if not (np.isfinite(ni) and np.isfinite(eps)) or abs(eps) < 0.05 or ni * eps <= 0:
+        return 1.0
+    k = round(np.log(ni / shares / eps) / np.log(1000))
+    return float(1000 ** k) if k > 0 else 1.0
+
+
+def book_to_market_table(
+    dates: list[pd.Timestamp],
+    tickers: list[str],
+    adj_prices: pd.DataFrame,
+    raw_prices: pd.DataFrame,
+    ciks: dict[str, int],
+) -> pd.DataFrame:
+    """Per (date, ticker): book equity per share (split-corrected to `date`) / as-traded close."""
+    rows = []
+    for t in tickers:
+        cik = ciks.get(t)
+        facts = load_facts(cik) if cik else pd.DataFrame()
+        for d in dates:
+            bm = np.nan
+            if not facts.empty and t in raw_prices and t in adj_prices:
+                bps, filed = book_per_share_asof(facts, d)
+                price = raw_prices[t].dropna().asof(d)
+                if filed is not None and np.isfinite(price) and price > 0:
+                    bm = float(bps / _split_factor(adj_prices[t], raw_prices[t], filed, d) / price)
+            rows.append({"date": d, "ticker": t, "bm": bm})
+    return pd.DataFrame(rows)
+
+
+VALUE_METRICS = ("ep", "bm", "cfp", "sp", "ebit_ev")
+
+
+def _recent_instant(facts: pd.DataFrame, tags: tuple[str, ...], asof: pd.Timestamp, max_age_days: int = 200) -> float:
+    """First tag with a balance-sheet value at most `max_age_days` old; NaN if none."""
+    for tag in tags:
+        val, end = _instant_asof(facts, tag, asof)
+        if end is not None and (asof - end).days <= max_age_days:
+            return val
+    return np.nan
+
+
+def value_metrics_asof(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, raw: pd.Series) -> dict:
+    """
+    Yields on market value at `asof`: TTM net income, latest book equity, TTM
+    operating cash flow and TTM revenue over market cap, and TTM operating income
+    over enterprise value (market cap + debt - cash). Market cap = latest weighted
+    diluted shares (split-corrected to `asof`) x as-traded close. Negative values
+    stay (they rank last); missing inputs give NaN.
+    """
+    out = {k: np.nan for k in VALUE_METRICS}
+    out["mcap"] = np.nan
+    f = facts[facts["tag"].isin(_SHARES) & facts["start"].notna() & (facts["filed"] <= asof)]
+    shares, filed = np.nan, None
+    for tag in _SHARES:
+        g = f[f["tag"] == tag]
+        if not g.empty:
+            last = g.sort_values(["end", "filed"]).iloc[-1]
+            if last["val"] > 0 and (asof - last["end"]).days <= 200:
+                shares, filed = float(last["val"]) * _share_scale(facts, asof, last["val"]), last["filed"]
+                break
+    price = raw.dropna().asof(asof)
+    if filed is None or not (np.isfinite(price) and price > 0):
+        return out
+    mcap = shares * _split_factor(adj, raw, filed, asof) * price
+    out["mcap"] = mcap
+    ni, _ = _ttm_flow(facts, ("NetIncomeLoss", "ProfitLoss"), asof)
+    cfo, _ = _ttm_flow(facts, ("NetCashProvidedByUsedInOperatingActivities",), asof)
+    rev, _ = _ttm_flow(facts, _REVENUE, asof)
+    ebit, _ = _ttm_flow(facts, ("OperatingIncomeLoss",), asof)
+    eq, eq_end = _equity_asof(facts, asof)
+    out["ep"], out["cfp"], out["sp"] = ni / mcap, cfo / mcap, rev / mcap
+    if eq_end is not None and (asof - eq_end).days <= 200:
+        out["bm"] = eq / mcap
+    lt = _recent_instant(facts, _LTD, asof)
+    cur = _recent_instant(facts, ("LongTermDebtCurrent", "DebtCurrent"), asof)
+    st = _recent_instant(facts, ("ShortTermBorrowings",), asof)
+    cash = _recent_instant(facts, ("CashAndCashEquivalentsAtCarryingValue",
+                                   "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"), asof)
+    ev = mcap + sum(x for x in (lt, cur, st) if np.isfinite(x)) - (cash if np.isfinite(cash) else 0.0)
+    if ev > 0:
+        out["ebit_ev"] = ebit / ev
+    return out
+
+
+def value_metrics_table(
+    dates: list[pd.Timestamp],
+    tickers: list[str],
+    adj_prices: pd.DataFrame,
+    raw_prices: pd.DataFrame,
+    ciks: dict[str, int],
+) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        cik = ciks.get(t)
+        facts = load_facts(cik) if cik else pd.DataFrame()
+        for d in dates:
+            row = {"date": d, "ticker": t, **{k: np.nan for k in VALUE_METRICS}, "mcap": np.nan}
+            if not facts.empty and t in raw_prices and t in adj_prices:
+                row.update(value_metrics_asof(facts, d, adj_prices[t], raw_prices[t]))
+            rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def value_screen_table(

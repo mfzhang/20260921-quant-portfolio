@@ -1,10 +1,11 @@
 """
 Pre-fetch the PIT price universe into the local cache at a pace that stays
 under the Tiingo free tier (50 requests/hour). Safe to stop and re-run:
-cached names are skipped.
+cached names are skipped. One request caches both adjusted and as-traded closes.
 
 --raw fetches as-traded (unadjusted) closes for names that already have
 adjusted prices; valuation ratios (P/E) must use these, not adjusted prices.
+--index sp400 --max 200 prices another pitindex universe (default: config).
 """
 
 from __future__ import annotations
@@ -24,14 +25,23 @@ from data.universe_pit import pit_price_tickers
 PAUSE_SEC = 75  # 48 requests/hour
 
 
+def _arg(name: str, default: str) -> str:
+    return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
+
+
 def main() -> None:
     field = "close" if "--raw" in sys.argv else "adjClose"
+    index = _arg("--index", config.PIT_INDEX)
+    max_names = int(_arg("--max", str(config.PIT_MAX_PRICED_NAMES)))
     tickers = pit_price_tickers(
         config.START,
-        index=config.PIT_INDEX,
-        max_names=int(config.PIT_MAX_PRICED_NAMES),
-        seed=config.UNIVERSE,
+        index=index,
+        max_names=max_names,
+        seed=config.UNIVERSE if index == config.PIT_INDEX else None,
+        include_unknown_sector=index != config.PIT_INDEX,
     )
+    if index != config.PIT_INDEX:
+        tickers += [t for t in _arg("--extra", "").split(",") if t]
     if field != "adjClose":
         end_key = config.END or "latest"
         tickers = [
@@ -40,7 +50,7 @@ def main() -> None:
         ]
     cached = set(cached_tiingo_tickers(config.START, config.END, field=field))
     need = [t for t in tickers if t not in cached]
-    print(f"Universe {len(tickers)} names ({field}): cached {len(tickers) - len(need)}, to fetch {len(need)}")
+    print(f"Universe {index} {len(tickers)} names ({field}): cached {len(tickers) - len(need)}, to fetch {len(need)}")
     print(f"ETA ~{len(need) * PAUSE_SEC / 3600:.1f} h at {3600 // PAUSE_SEC} requests/hour")
 
     empty = []
