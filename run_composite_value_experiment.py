@@ -112,18 +112,27 @@ def main() -> None:
 
     live = prices.index > rebal[0]
     bench = bench_px.pct_change().fillna(0.0)[live]
+    rets = prices.pct_change(fill_method=None).fillna(0.0)
     rows, series = [], {}
     order = ["Q5", "arithmetic top 20%", "Q4", "Q3", "Q2", "Q1", "eligible EW", "all members EW"]
     for label in order:
         w = basket_weights(prices.index, tickers, books[label], rebal, membership, prices)
         w.loc[~live] = 0.0
         net, turnover, longs, _ = book_returns(prices, w)
+        # book_returns charges costs on every daily weight change, drift included;
+        # trade_turnover counts only actual trades (target vs drifted weights)
+        lag = w.shift(1).fillna(0.0)
+        gross = (lag * rets).sum(axis=1)
+        drifted = (lag * (1.0 + rets)).div(1.0 + gross, axis=0)
+        trades = (w - drifted).abs().sum(axis=1)
         net, turnover, longs = net[live], turnover[live], longs[live]
         series[label] = net
-        rows.append(_stats(label, net, bench, {"avg_long": float(longs.mean()),
-                                               "turnover": float(turnover.mean() * ANN)}))
+        rows.append(_stats(label, net, bench, {"cagr_gross": _cagr(gross[live]), "avg_long": float(longs.mean()),
+                                               "turnover": float(turnover.mean() * ANN),
+                                               "trade_turnover": float(trades[live].mean() * ANN)}))
     series[BENCH] = bench
-    rows.append(_stats(BENCH, bench, bench, {"avg_long": 1.0, "turnover": 0.0}))
+    rows.append(_stats(BENCH, bench, bench, {"cagr_gross": _cagr(bench), "avg_long": 1.0, "turnover": 0.0,
+                                             "trade_turnover": 0.0}))
     table = pd.DataFrame(rows).replace({"book": {"Q5": "Q5 = geometric top 20% (primary)"}})
     table.to_csv(OUT / "comparison.csv", index=False)
     pd.DataFrame(series).to_csv(OUT / "daily_returns.csv")
@@ -131,12 +140,15 @@ def main() -> None:
     print(f"\n=== {prices.index[live][0].date()} ~ {prices.index[-1].date()} (train <= {SPLIT.date()} < test) ===")
     print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
     print("\nSpreads (annualized mean, t-stat; full / train / test):")
+    spreads = []
     for a, b in (("Q5", "eligible EW"), ("Q5", "Q1"), ("Q5", BENCH), ("arithmetic top 20%", "eligible EW"),
                  ("eligible EW", "all members EW")):
         diff = series[a] - series[b]
-        parts = [f"{diff[m].mean() * ANN:+.2%} (t {_tstat(diff[m]):+.2f})"
-                 for m in (diff.index == diff.index, diff.index <= SPLIT, diff.index > SPLIT)]
-        print(f"  {a} - {b}: " + " / ".join(parts))
+        masks = {"full": diff.index == diff.index, "train": diff.index <= SPLIT, "test": diff.index > SPLIT}
+        spreads += [{"spread": f"{a} - {b}", "period": k, "ann_mean": diff[m].mean() * ANN, "t": _tstat(diff[m])}
+                    for k, m in masks.items()]
+        print(f"  {a} - {b}: " + " / ".join(f"{s['ann_mean']:+.2%} (t {s['t']:+.2f})" for s in spreads[-3:]))
+    pd.DataFrame(spreads).to_csv(OUT / "spreads.csv", index=False)
 
     rel = (1 + series["Q5"]).cumprod() / (1 + series["eligible EW"]).cumprod()
     under = rel / rel.cummax() - 1

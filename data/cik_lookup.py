@@ -66,13 +66,22 @@ def sic_codes(ciks: list[int]) -> dict[int, int]:
     path = CACHE / "sic_codes.json"
     cache = {int(k): v for k, v in json.loads(path.read_text()).items()} if path.exists() else {}
     agent = env_value("SEC_USER_AGENT")
-    for cik in set(ciks) - set(cache):
-        resp = requests.get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json",
-                            headers={"User-Agent": agent}, timeout=60)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    for i, cik in enumerate(sorted(set(ciks) - set(cache)), 1):
+        for attempt in range(3):
+            try:
+                resp = requests.get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json",
+                                    headers={"User-Agent": agent}, timeout=60)
+                break
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                time.sleep(5)
         sic = resp.json().get("sic") if resp.status_code == 200 else None
         cache[cik] = int(sic) if sic else None
         time.sleep(0.15)
-    CACHE.mkdir(parents=True, exist_ok=True)
+        if i % 20 == 0:
+            path.write_text(json.dumps({str(k): v for k, v in cache.items()}))
     path.write_text(json.dumps({str(k): v for k, v in cache.items()}))
     return {c: cache[c] for c in ciks if cache.get(c) is not None}
 

@@ -50,8 +50,13 @@ TAGS = (
     "LongTermDebtCurrent",
     "DebtCurrent",
     "ShortTermBorrowings",
+    "ResearchAndDevelopmentExpense",
+    "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+    "SellingGeneralAndAdministrativeExpense",
+    "SellingAndMarketingExpense",
+    "GeneralAndAdministrativeExpense",
 )
-_CACHE_VERSION = "v5"  # bump when TAGS change so cached extracts are refetched
+_CACHE_VERSION = "v6"  # bump when TAGS change so cached extracts are refetched
 _PAUSE_SEC = 0.15  # SEC fair-access limit is 10 requests/second
 
 
@@ -59,11 +64,18 @@ def _fetch_facts(cik: int) -> pd.DataFrame:
     agent = env_value("SEC_USER_AGENT")
     if not agent:
         raise RuntimeError('SEC_USER_AGENT is not set (e.g. "name research you@example.com")')
-    resp = requests.get(
-        FACTS_URL.format(cik=cik),
-        headers={"User-Agent": agent, "Accept-Encoding": "gzip, deflate"},
-        timeout=60,
-    )
+    for attempt in range(5):
+        try:
+            resp = requests.get(
+                FACTS_URL.format(cik=cik),
+                headers={"User-Agent": agent, "Accept-Encoding": "gzip, deflate"},
+                timeout=60,
+            )
+            break
+        except requests.RequestException:
+            if attempt == 4:
+                raise
+            time.sleep(10 * (attempt + 1))
     if resp.status_code == 404:
         return pd.DataFrame()
     resp.raise_for_status()
@@ -82,7 +94,10 @@ def load_facts(cik: int) -> pd.DataFrame:
     SEC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = SEC_CACHE_DIR / f"CIK{cik:010d}_{_CACHE_VERSION}.csv"
     if path.exists():
-        df = pd.read_csv(path) if path.stat().st_size > 1 else pd.DataFrame()
+        try:
+            df = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            df = pd.DataFrame()
     else:
         df = _fetch_facts(cik)
         df.to_csv(path, index=False)
@@ -368,14 +383,32 @@ def book_per_share_asof(facts: pd.DataFrame, asof: pd.Timestamp) -> tuple[float,
 
 
 def _share_scale(facts: pd.DataFrame, asof: pd.Timestamp, shares: float) -> float:
-    """Some filers tag share counts in thousands or millions; recover the unit
-    from net income / shares vs reported EPS (powers of 1000 only)."""
+    """Some filers tag share counts in thousands or millions, or x1000 too large;
+    recover the unit (powers of 1000 only) from net income / shares vs reported
+    EPS, else, when EPS carries the same tagging error, from the median share
+    count the issuer filed over the prior two years."""
+    def near_power(ratio: float) -> int:
+        # splits move ratios by up to ~50x, so only accept ~1000^k within a factor of 3
+        x = np.log(ratio) / np.log(1000)
+        k = round(x)
+        return k if abs(x - k) < 0.16 else 0
+
     ni, _ = _ttm_flow(facts, ("NetIncomeLoss", "ProfitLoss"), asof)
     eps, _ = ttm_eps_asof(facts, asof)
-    if not (np.isfinite(ni) and np.isfinite(eps)) or abs(eps) < 0.05 or ni * eps <= 0:
-        return 1.0
-    k = round(np.log(ni / shares / eps) / np.log(1000))
-    return float(1000 ** k) if k > 0 else 1.0
+    if np.isfinite(ni) and np.isfinite(eps) and abs(eps) >= 0.05 and ni * eps > 0:
+        ratio = ni / shares / eps
+        k = round(np.log(ratio) / np.log(1000))
+        if k > 0:
+            return float(1000.0 ** k)
+        if near_power(ratio) < 0:
+            return float(1000.0 ** near_power(ratio))
+        if abs(eps) < 1000:  # EPS confirms the unit; a $1000+ EPS is itself mis-tagged
+            return 1.0
+    past = facts[facts["tag"].isin(_SHARES) & facts["start"].notna() & (facts["filed"] <= asof)
+                 & (facts["filed"] > asof - pd.Timedelta(days=730)) & (facts["val"] > 0)]["val"]
+    if len(past) >= 4 and near_power(past.median() / shares) != 0:
+        return float(1000.0 ** near_power(past.median() / shares))
+    return 1.0
 
 
 def book_to_market_table(
@@ -413,16 +446,9 @@ def _recent_instant(facts: pd.DataFrame, tags: tuple[str, ...], asof: pd.Timesta
     return np.nan
 
 
-def value_metrics_asof(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, raw: pd.Series) -> dict:
-    """
-    Yields on market value at `asof`: TTM net income, latest book equity, TTM
-    operating cash flow and TTM revenue over market cap, and TTM operating income
-    over enterprise value (market cap + debt - cash). Market cap = latest weighted
-    diluted shares (split-corrected to `asof`) x as-traded close. Negative values
-    stay (they rank last); missing inputs give NaN.
-    """
-    out = {k: np.nan for k in VALUE_METRICS}
-    out["mcap"] = np.nan
+def _value_inputs(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, raw: pd.Series) -> dict | None:
+    """Market cap, EV and the TTM / latest accounting inputs behind the value
+    yields; None when shares or price are missing."""
     f = facts[facts["tag"].isin(_SHARES) & facts["start"].notna() & (facts["filed"] <= asof)]
     shares, filed = np.nan, None
     for tag in _SHARES:
@@ -434,25 +460,172 @@ def value_metrics_asof(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, 
                 break
     price = raw.dropna().asof(asof)
     if filed is None or not (np.isfinite(price) and price > 0):
-        return out
+        return None
     mcap = shares * _split_factor(adj, raw, filed, asof) * price
-    out["mcap"] = mcap
-    ni, _ = _ttm_flow(facts, ("NetIncomeLoss", "ProfitLoss"), asof)
-    cfo, _ = _ttm_flow(facts, ("NetCashProvidedByUsedInOperatingActivities",), asof)
-    rev, _ = _ttm_flow(facts, _REVENUE, asof)
-    ebit, _ = _ttm_flow(facts, ("OperatingIncomeLoss",), asof)
     eq, eq_end = _equity_asof(facts, asof)
-    out["ep"], out["cfp"], out["sp"] = ni / mcap, cfo / mcap, rev / mcap
-    if eq_end is not None and (asof - eq_end).days <= 200:
-        out["bm"] = eq / mcap
     lt = _recent_instant(facts, _LTD, asof)
     cur = _recent_instant(facts, ("LongTermDebtCurrent", "DebtCurrent"), asof)
     st = _recent_instant(facts, ("ShortTermBorrowings",), asof)
     cash = _recent_instant(facts, ("CashAndCashEquivalentsAtCarryingValue",
                                    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"), asof)
-    ev = mcap + sum(x for x in (lt, cur, st) if np.isfinite(x)) - (cash if np.isfinite(cash) else 0.0)
-    if ev > 0:
-        out["ebit_ev"] = ebit / ev
+    return {
+        "mcap": mcap,
+        "ni": _ttm_flow(facts, ("NetIncomeLoss", "ProfitLoss"), asof)[0],
+        "cfo": _ttm_flow(facts, ("NetCashProvidedByUsedInOperatingActivities",), asof)[0],
+        "rev": _ttm_flow(facts, _REVENUE, asof)[0],
+        "ebit": _ttm_flow(facts, ("OperatingIncomeLoss",), asof)[0],
+        "eq": eq if eq_end is not None and (asof - eq_end).days <= 200 else np.nan,
+        "ev": mcap + sum(x for x in (lt, cur, st) if np.isfinite(x)) - (cash if np.isfinite(cash) else 0.0),
+    }
+
+
+def value_metrics_asof(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, raw: pd.Series) -> dict:
+    """
+    Yields on market value at `asof`: TTM net income, latest book equity, TTM
+    operating cash flow and TTM revenue over market cap, and TTM operating income
+    over enterprise value (market cap + debt - cash). Market cap = latest weighted
+    diluted shares (split-corrected to `asof`) x as-traded close. Negative values
+    stay (they rank last); missing inputs give NaN.
+    """
+    out = {k: np.nan for k in VALUE_METRICS}
+    out["mcap"] = np.nan
+    v = _value_inputs(facts, asof, adj, raw)
+    if v is None:
+        return out
+    mcap = v["mcap"]
+    out["mcap"] = mcap
+    out["ep"], out["cfp"], out["sp"], out["bm"] = v["ni"] / mcap, v["cfo"] / mcap, v["rev"] / mcap, v["eq"] / mcap
+    if v["ev"] > 0:
+        out["ebit_ev"] = v["ebit"] / v["ev"]
+    return out
+
+
+# Intangible capital by perpetual inventory (Peters & Taylor 2017; Eisfeldt,
+# Kim & Papanikolaou 2020): K(t) = (1 - delta) K(t-1) + share * X(t), started at
+# the steady state K0 = share * X0 / (g + delta) in the first fiscal year the
+# item is reported. Annual flows come from 10-K / 10-K/A filings only.
+RD_DEPR, ORG_DEPR, ORG_SHARE, INIT_GROWTH = 0.15, 0.20, 0.30, 0.10
+_RD = ("ResearchAndDevelopmentExpense", "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost")
+_SGA = ("SellingGeneralAndAdministrativeExpense",)
+_SGA_PARTS = ("SellingAndMarketingExpense", "GeneralAndAdministrativeExpense")
+_OPINC = ("OperatingIncomeLoss",)
+_FY_TAGS = ("NetIncomeLoss", "ProfitLoss", *_OPINC, *_REVENUE, *_COGS, *_RD, *_SGA, *_SGA_PARTS)
+INTANGIBLE_FIELDS = ("k_rd", "k_org", "k_rd_prev", "k_org_prev", "rd", "sga", "has_rd", "has_sga",
+                     "sga_incl_rd", "fy_end")
+ADJ_VALUE_METRICS = ("ep_adj", "bm_adj", "cfp", "sp", "ebit_ev_adj")
+
+
+def _annual_by_year(facts: pd.DataFrame, asof: pd.Timestamp) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    """~1-year USD flows from 10-K filings on or before `asof`, tagged with a
+    fiscal-year id (period ends within 300 days of the year's first end, which
+    absorbs 52/53-week calendars). Returns (facts with "fy", end date per fy)."""
+    ann = facts[facts["form"].isin(["10-K", "10-K/A"]) & (facts["filed"] <= asof) & facts["start"].notna()
+                & facts["tag"].isin(_FY_TAGS) & (facts["unit"] == "USD")]
+    ann = ann[(ann["end"] - ann["start"]).dt.days.between(340, 380)].copy()
+    if ann.empty:
+        return ann, []
+    first, ends, ids = None, [], {}
+    for e in pd.DatetimeIndex(ann["end"].unique()).sort_values():
+        if first is None or (e - first).days > 300:
+            first = e
+            ends.append(e)
+        ids[e] = len(ends) - 1
+        ends[-1] = e
+    ann["fy"] = ann["end"].map(ids)
+    return ann, ends
+
+
+def _year_value(ann: pd.DataFrame, tags: tuple[str, ...], fy: int) -> float:
+    """First tag in `tags` reported for the year, latest filing wins."""
+    g = ann[(ann["fy"] == fy) & ann["tag"].isin(tags)]
+    for tag in tags:
+        h = g[g["tag"] == tag]
+        if not h.empty:
+            return float(h.sort_values("filed").iloc[-1]["val"])
+    return np.nan
+
+
+def _perpetual(flows: list[float], ends: list[pd.Timestamp], delta: float, share: float) -> tuple[float, float]:
+    """(stock at the latest year, stock one year earlier). Years before the item
+    is first reported carry nothing; later missing years invest 0; a skipped
+    fiscal year depreciates the stock once more."""
+    k = k_prev = np.nan
+    for i, x in enumerate(flows):
+        if not np.isfinite(k):
+            if np.isfinite(x):
+                k = share * x / (INIT_GROWTH + delta)
+                k_prev = k / (1.0 + INIT_GROWTH)
+            continue
+        years = max(1, round((ends[i] - ends[i - 1]).days / 365.25))
+        k_prev = k
+        k = k * (1.0 - delta) ** years + share * (x if np.isfinite(x) else 0.0)
+    return (0.0, 0.0) if not np.isfinite(k) else (float(k), float(k_prev))
+
+
+def intangible_capital_asof(facts: pd.DataFrame, asof: pd.Timestamp, max_age_days: int = 550) -> dict:
+    """
+    Knowledge capital (R&D, 15%/yr depreciation) and organization capital (30%
+    of SG&A, 20%/yr) at the latest fiscal year filed on 10-K by `asof`, plus the
+    previous year's stocks and the latest-year flows (missing -> 0). Filers that
+    tag selling/marketing and G&A separately (MSFT, GOOGL, META) get their sum
+    as SG&A for years without the combined tag. When SG&A
+    plus R&D plus cost of revenue overshoots total operating costs (revenue -
+    operating income) by more than 0.5% of revenue but SG&A plus cost of revenue
+    does not, SG&A is taken to include R&D and R&D is subtracted from it. All
+    NaN when no fiscal year ends within `max_age_days` of `asof`.
+    """
+    out = {k: np.nan for k in INTANGIBLE_FIELDS}
+    ann, ends = _annual_by_year(facts, asof) if not facts.empty else (pd.DataFrame(), [])
+    if not ends or (asof - ends[-1]).days > max_age_days:
+        return out
+    rd, sga, combined = [], [], []
+    for fy in range(len(ends)):
+        r, s = _year_value(ann, _RD, fy), _year_value(ann, _SGA, fy)
+        if not np.isfinite(s):
+            parts = [_year_value(ann, (tag,), fy) for tag in _SGA_PARTS]
+            s = sum(p for p in parts if np.isfinite(p)) if any(np.isfinite(p) for p in parts) else np.nan
+        rev, op, cogs = _year_value(ann, _REVENUE, fy), _year_value(ann, _OPINC, fy), _year_value(ann, _COGS, fy)
+        flag = False
+        if all(np.isfinite(v) for v in (r, s, rev, op, cogs)) and rev > 0 and r > 0 and s >= r:
+            costs, tol = rev - op, 0.005 * rev
+            flag = cogs + s + r > costs + tol and cogs + s <= costs + tol
+        rd.append(r)
+        sga.append(s - r if flag else s)
+        combined.append(flag)
+    out["k_rd"], out["k_rd_prev"] = _perpetual(rd, ends, RD_DEPR, 1.0)
+    out["k_org"], out["k_org_prev"] = _perpetual(sga, ends, ORG_DEPR, ORG_SHARE)
+    out["rd"] = rd[-1] if np.isfinite(rd[-1]) else 0.0
+    out["sga"] = sga[-1] if np.isfinite(sga[-1]) else 0.0
+    out["has_rd"], out["has_sga"] = int(np.isfinite(rd[-1])), int(np.isfinite(sga[-1]))
+    out["sga_incl_rd"] = int(combined[-1])
+    out["fy_end"] = ends[-1]
+    return out
+
+
+def intangible_value_metrics_asof(facts: pd.DataFrame, asof: pd.Timestamp, adj: pd.Series, raw: pd.Series) -> dict:
+    """
+    Standard value yields plus intangible-adjusted ones (no tax adjustment):
+      bm_adj      = (book equity + K_rd + K_org) / mcap
+      ep_adj      = (TTM net income + add-back) / mcap
+      ebit_ev_adj = (TTM operating income + add-back) / EV
+      add-back    = [R&D - 0.15 K_rd(prev)] + [0.30 SG&A - 0.20 K_org(prev)]
+    i.e. intangible investment expensed in the latest fiscal year is put back
+    and the amortization of the capitalized stock is charged instead.
+    """
+    out = {**{k: np.nan for k in (*VALUE_METRICS, "ep_adj", "bm_adj", "ebit_ev_adj", "mcap")},
+           **intangible_capital_asof(facts, asof)}
+    v = _value_inputs(facts, asof, adj, raw)
+    if v is None:
+        return out
+    mcap = v["mcap"]
+    out["mcap"] = mcap
+    out["ep"], out["cfp"], out["sp"], out["bm"] = v["ni"] / mcap, v["cfo"] / mcap, v["rev"] / mcap, v["eq"] / mcap
+    add = (out["rd"] - RD_DEPR * out["k_rd_prev"]) + (ORG_SHARE * out["sga"] - ORG_DEPR * out["k_org_prev"])
+    out["ep_adj"] = (v["ni"] + add) / mcap
+    out["bm_adj"] = (v["eq"] + out["k_rd"] + out["k_org"]) / mcap
+    if v["ev"] > 0:
+        out["ebit_ev"] = v["ebit"] / v["ev"]
+        out["ebit_ev_adj"] = (v["ebit"] + add) / v["ev"]
     return out
 
 
@@ -471,6 +644,25 @@ def value_metrics_table(
             row = {"date": d, "ticker": t, **{k: np.nan for k in VALUE_METRICS}, "mcap": np.nan}
             if not facts.empty and t in raw_prices and t in adj_prices:
                 row.update(value_metrics_asof(facts, d, adj_prices[t], raw_prices[t]))
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def intangible_value_table(
+    dates: list[pd.Timestamp],
+    tickers: list[str],
+    adj_prices: pd.DataFrame,
+    raw_prices: pd.DataFrame,
+    ciks: dict[str, int],
+) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        cik = ciks.get(t)
+        facts = load_facts(cik) if cik else pd.DataFrame()
+        for d in dates:
+            row = {"date": d, "ticker": t}
+            if not facts.empty and t in raw_prices and t in adj_prices:
+                row.update(intangible_value_metrics_asof(facts, d, adj_prices[t], raw_prices[t]))
             rows.append(row)
     return pd.DataFrame(rows)
 
