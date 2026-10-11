@@ -7,7 +7,7 @@ SPLIT = "2023-05-10"  # same train / held-out boundary as the US work
 
 # Costs: commission + slippage per unit turnover; securities transaction tax on sells only
 COMMISSION_BPS = 1.5
-SLIPPAGE_BPS = 10.0
+SLIPPAGE_BPS = 20.0
 # KOSPI sell-side tax incl. special rural tax, effective from each date
 SELL_TAX_SCHEDULE = [
     ("2018-01-01", 0.0025),
